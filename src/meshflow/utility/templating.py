@@ -19,6 +19,8 @@ import xarray as xr
 import json
 import copy
 import warnings
+import math
+import numbers
 
 from typing import (
     Dict,
@@ -80,16 +82,66 @@ environment = Environment(
 environment.globals['raise'] = raise_helper
 
 
+def _is_nan(value: Any) -> bool:
+    """Return ``True`` if *value* is a real numeric NaN.
+
+    Covers plain ``float('nan')`` and NumPy real scalars
+    (``numpy.floating`` instances register as ``numbers.Real``).
+    Booleans are excluded explicitly. Strings (including ``"nan"``),
+    ``None``, and non-numeric objects return ``False``.
+    """
+    return (
+        isinstance(value, numbers.Real)
+        and not isinstance(value, bool)
+        and math.isnan(value)
+    )
+
+
 def deep_merge(
     d1: Dict[str, Any],
     d2: Dict[str, Any],
+    _path: str = "",
 ) -> Dict[str, Any]:
     """
     Recursively merge d2 dictionary into d1.
+
+    Values in ``d2`` that are NaN are treated as missing: the
+    corresponding default value in ``d1`` is kept and a
+    :class:`UserWarning` is emitted naming the parameter by its dotted
+    key path (e.g. ``line5.fcan``). If a NaN value has no counterpart in
+    ``d1`` (no default exists), the key is omitted from ``d1`` and a
+    warning is emitted as well.
+
+    Parameters
+    ----------
+    d1 : dict
+        Dictionary providing default values; mutated in place and returned.
+    d2 : dict
+        Dictionary with overriding values.
+
+    Returns
+    -------
+    dict
+        The merged dictionary (same object as ``d1``).
     """
     for key, value in d2.items():
+        dotted = f"{_path}.{key}" if _path else str(key)
+        if _is_nan(value):
+            if key in d1:
+                warnings.warn(
+                    f"NaN value provided for parameter '{dotted}'; "
+                    f"reverting to the default value ({d1[key]!r}).",
+                    stacklevel=2,
+                )
+            else:
+                warnings.warn(
+                    f"NaN value provided for parameter '{dotted}', but no "
+                    f"default value exists; the parameter will be omitted.",
+                    stacklevel=2,
+                )
+            continue
         if key in d1 and isinstance(d1[key], dict) and isinstance(value, dict):
-            deep_merge(d1[key], value)  # Recursive merge for nested dictionaries
+            deep_merge(d1[key], value, _path=dotted)  # Recursive merge for nested dictionaries
         else:
             d1[key] = value  # Overwrite or add new key-value pair
     return d1
@@ -107,6 +159,12 @@ def render_class_template(
 ) -> str:
     """
     Render a CLASS configuration file using Jinja2 templates.
+
+    Notes
+    -----
+    Parameter values equal to NaN are ignored and fall back to the default
+    parameter set (see `deep_merge`); a warning is emitted for each such
+    parameter.
 
     Parameters
     ----------
@@ -293,6 +351,12 @@ def render_hydrology_template(
     """
     Render a hydrology parameters INI template using Jinja2.
 
+    Notes
+    -----
+    Parameter values equal to NaN are ignored and fall back to the default
+    parameter set (see `deep_merge`); a warning is emitted for each such
+    parameter.
+
     Parameters
     ----------
     routing_params : dict, optional
@@ -342,20 +406,23 @@ def render_hydrology_template(
     hydrology_defaults = data.get('hydrology')
 
     # support dict format with grouped keys (e.g., (0, 1): {...})
-    if isinstance(routing_params, dict):
+    if isinstance(routing_params, dict) and routing_params:
         routing_expanded = expand_grouped_keys(routing_params)
         max_idx = max(int(k) for k in routing_expanded.keys())
         routing_list = [{} for _ in range(max_idx + 1)]
         for idx, params in routing_expanded.items():
             routing_list[int(idx)] = params
         routing_params = routing_list
+    elif isinstance(routing_params, dict):
+        # an empty dict means no routing blocks (same as an empty list)
+        routing_params = []
 
     # deep update routing block
     for idx, routing_block in enumerate(routing_params):
         defaults = copy.deepcopy(routing_defaults)
 
-        # deep merge
-        defaults.update(routing_block)
+        # deep merge (NaN values in `routing_block` revert to defaults)
+        deep_merge(defaults, routing_block, _path=f"routing[{idx}]")
 
         # update the dict (list of dicts)
         routing_params[idx].update(defaults)
@@ -367,8 +434,8 @@ def render_hydrology_template(
     for gru, gru_hydro_params in hydrology_params.items():
         defaults = copy.deepcopy(hydrology_defaults)
 
-        # update default values
-        defaults.update(gru_hydro_params)
+        # deep merge (NaN values in `gru_hydro_params` revert to defaults)
+        deep_merge(defaults, gru_hydro_params, _path=f"gru[{gru}]")
 
         # update the dict
         hydrology_params[gru].update(defaults)
